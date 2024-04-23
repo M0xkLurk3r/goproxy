@@ -272,7 +272,7 @@ func (pcond *ReqProxyConds) HijackConnect(f func(req *http.Request, client net.C
 		}))
 }
 
-func (pcond *ReqProxyConds) Layer7HijackConnect(f func(req *http.Request, client net.Conn, ctx *ProxyCtx)) {
+func (pcond *ReqProxyConds) Layer7HijackConnect(f func(seq Layer7RequestSequence, srcip *string, req *http.Request, resp *http.Response)) {
 	pcond.proxy.httpsHandlers = append(pcond.proxy.httpsHandlers,
 		FuncHttpsHandler(func(host string, ctx *ProxyCtx) (*ConnectAction, string) {
 			for _, cond := range pcond.reqConds {
@@ -280,7 +280,7 @@ func (pcond *ReqProxyConds) Layer7HijackConnect(f func(req *http.Request, client
 					return nil, ""
 				}
 			}
-			return &ConnectAction{Action: ConnectLayer7Hijack, Hijack: f}, host
+			return &ConnectAction{Action: ConnectLayer7Hijack, Layer7Hijack: f}, host
 		}))
 }
 
