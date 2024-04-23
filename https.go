@@ -27,6 +27,7 @@ const (
 	ConnectHijack
 	ConnectHTTPMitm
 	ConnectProxyAuthHijack
+	ConnectLayer7Hijack
 )
 
 var (
@@ -321,6 +322,10 @@ func (proxy *ProxyHttpServer) handleHttps(w http.ResponseWriter, r *http.Request
 			}
 			ctx.Logf("Exiting on EOF")
 		}()
+	case ConnectLayer7Hijack:
+		{
+
+		}
 	case ConnectProxyAuthHijack:
 		proxyClient.Write([]byte("HTTP/1.1 407 Proxy Authentication Required\r\n"))
 		todo.Hijack(r, proxyClient, ctx)
