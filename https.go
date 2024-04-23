@@ -31,11 +31,12 @@ const (
 )
 
 var (
-	OkConnect       = &ConnectAction{Action: ConnectAccept, TLSConfig: TLSConfigFromCA(&GoproxyCa)}
-	MitmConnect     = &ConnectAction{Action: ConnectMitm, TLSConfig: TLSConfigFromCA(&GoproxyCa)}
-	HTTPMitmConnect = &ConnectAction{Action: ConnectHTTPMitm, TLSConfig: TLSConfigFromCA(&GoproxyCa)}
-	RejectConnect   = &ConnectAction{Action: ConnectReject, TLSConfig: TLSConfigFromCA(&GoproxyCa)}
-	httpsRegexp     = regexp.MustCompile(`^https:\/\/`)
+	OkConnect              = &ConnectAction{Action: ConnectAccept, TLSConfig: TLSConfigFromCA(&GoproxyCa)}
+	MitmConnect            = &ConnectAction{Action: ConnectMitm, TLSConfig: TLSConfigFromCA(&GoproxyCa)}
+	HTTPMitmConnect        = &ConnectAction{Action: ConnectHTTPMitm, TLSConfig: TLSConfigFromCA(&GoproxyCa)}
+	RejectConnect          = &ConnectAction{Action: ConnectReject, TLSConfig: TLSConfigFromCA(&GoproxyCa)}
+	httpsRegexp            = regexp.MustCompile(`^https:\/\/`)
+	DefaultHijackTLSConfig = TLSConfigFromCA(&GoproxyCa)
 )
 
 // ConnectAction enables the caller to override the standard connect flow.
@@ -342,6 +343,15 @@ func (proxy *ProxyHttpServer) handleHttps(w http.ResponseWriter, r *http.Request
 		if todo.TLSConfig != nil {
 			var err error
 			tlsConfig, err = todo.TLSConfig(host, ctx)
+			if err != nil {
+				httpError(proxyClient, ctx, err)
+				return
+			}
+		}
+		// Anthony Lee added -- set up TLSConfig from DefaultTLSConfig
+		if DefaultHijackTLSConfig != nil {
+			var err error
+			tlsConfig, err = DefaultHijackTLSConfig(host, ctx)
 			if err != nil {
 				httpError(proxyClient, ctx, err)
 				return
