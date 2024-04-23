@@ -42,10 +42,19 @@ var (
 // When Action is ConnectHijack, it is up to the implementer to send the
 // HTTP 200, or any other valid http response back to the client from within the
 // Hijack func
+
+type Layer7RequestSequence int
+
+const (
+	Layer7BeforeRequest Layer7RequestSequence = iota
+	Layer7AfterRequest
+)
+
 type ConnectAction struct {
-	Action    ConnectActionLiteral
-	Hijack    func(req *http.Request, client net.Conn, ctx *ProxyCtx)
-	TLSConfig func(host string, ctx *ProxyCtx) (*tls.Config, error)
+	Action       ConnectActionLiteral
+	Hijack       func(req *http.Request, client net.Conn, ctx *ProxyCtx)
+	Layer7Hijack func(seq Layer7RequestSequence, srcip *string, req *http.Request, resp *http.Response)
+	TLSConfig    func(host string, ctx *ProxyCtx) (*tls.Config, error)
 }
 
 func stripPort(s string) string {
@@ -323,9 +332,137 @@ func (proxy *ProxyHttpServer) handleHttps(w http.ResponseWriter, r *http.Request
 			ctx.Logf("Exiting on EOF")
 		}()
 	case ConnectLayer7Hijack:
-		{
-
+		proxyClient.Write([]byte("HTTP/1.0 200 OK\r\n\r\n"))
+		ctx.Logf("Assuming CONNECT is TLS, mitm proxying it")
+		// this goes in a separate goroutine, so that the net/http server won't think we're
+		// still handling the request even after hijacking the connection. Those HTTP CONNECT
+		// request can take forever, and the server will be stuck when "closed".
+		// TODO: Allow Server.Close() mechanism to shut down this connection as nicely as possible
+		tlsConfig := defaultTLSConfig
+		if todo.TLSConfig != nil {
+			var err error
+			tlsConfig, err = todo.TLSConfig(host, ctx)
+			if err != nil {
+				httpError(proxyClient, ctx, err)
+				return
+			}
 		}
+		go func() {
+			//TODO: cache connections to the remote website
+			rawClientTls := tls.Server(proxyClient, tlsConfig)
+			if err := rawClientTls.Handshake(); err != nil {
+				ctx.Warnf("Cannot handshake client %v %v", r.Host, err)
+				return
+			}
+			defer rawClientTls.Close()
+			clientTlsReader := bufio.NewReader(rawClientTls)
+			for !isEof(clientTlsReader) {
+				req, err := http.ReadRequest(clientTlsReader)
+				var ctx = &ProxyCtx{Req: req, Session: atomic.AddInt64(&proxy.sess, 1), Proxy: proxy, UserData: ctx.UserData}
+				if err != nil && err != io.EOF {
+					return
+				}
+				if err != nil {
+					ctx.Warnf("Cannot read TLS request from mitm'd client %v %v", r.Host, err)
+					return
+				}
+				req.RemoteAddr = r.RemoteAddr // since we're converting the request, need to carry over the original connecting IP as well
+				ctx.Logf("req %v", r.Host)
+
+				if !httpsRegexp.MatchString(req.URL.String()) {
+					req.URL, err = url.Parse("https://" + r.Host + req.URL.String())
+				}
+
+				// Bug fix which goproxy fails to provide request
+				// information URL in the context when does HTTPS MITM
+				ctx.Req = req
+
+				req, resp := proxy.filterRequest(req, ctx)
+				if resp == nil {
+					if isWebSocketRequest(req) {
+						ctx.Logf("Request looks like websocket upgrade.")
+						proxy.serveWebsocketTLS(ctx, w, req, tlsConfig, rawClientTls)
+						return
+					}
+					if err != nil {
+						if req.URL != nil {
+							ctx.Warnf("Illegal URL %s", "https://"+r.Host+req.URL.Path)
+						} else {
+							ctx.Warnf("Illegal URL %s", "https://"+r.Host)
+						}
+						return
+					}
+					removeProxyHeaders(ctx, req)
+
+					todo.Layer7Hijack(Layer7BeforeRequest, &r.RemoteAddr, r, nil)
+
+					resp, err = func() (*http.Response, error) {
+						// explicitly discard request body to avoid data races in certain RoundTripper implementations
+						// see https://github.com/golang/go/issues/61596#issuecomment-1652345131
+						defer req.Body.Close()
+						return ctx.RoundTrip(req)
+					}()
+					if err != nil {
+						ctx.Warnf("Cannot read TLS response from mitm'd server %v", err)
+						return
+					}
+					ctx.Logf("resp %v", resp.Status)
+				}
+				resp = proxy.filterResponse(resp, ctx)
+				defer resp.Body.Close()
+
+				text := resp.Status
+				statusCode := strconv.Itoa(resp.StatusCode) + " "
+				if strings.HasPrefix(text, statusCode) {
+					text = text[len(statusCode):]
+				}
+
+				if resp.Request.Method == "HEAD" {
+					// don't change Content-Length for HEAD request
+				} else {
+					// Since we don't know the length of resp, return chunked encoded response
+					// TODO: use a more reasonable scheme
+					resp.Header.Del("Content-Length")
+					resp.Header.Set("Transfer-Encoding", "chunked")
+				}
+				// Force connection close otherwise chrome will keep CONNECT tunnel open forever
+				resp.Header.Set("Connection", "close")
+				todo.Layer7Hijack(Layer7AfterRequest, &req.RemoteAddr, req, resp)
+				// Anthony Lee changed -- move down those client answer code
+				// always use 1.1 to support chunked encoding
+				if _, err := io.WriteString(rawClientTls, "HTTP/1.1"+" "+statusCode+text+"\r\n"); err != nil {
+					ctx.Warnf("Cannot write TLS response HTTP status from mitm'd client: %v", err)
+					return
+				}
+				if err := resp.Header.Write(rawClientTls); err != nil {
+					ctx.Warnf("Cannot write TLS response header from mitm'd client: %v", err)
+					return
+				}
+				if _, err = io.WriteString(rawClientTls, "\r\n"); err != nil {
+					ctx.Warnf("Cannot write TLS response header end from mitm'd client: %v", err)
+					return
+				}
+
+				if resp.Request.Method == "HEAD" {
+					// Don't write out a response body for HEAD request
+				} else {
+					chunked := newChunkedWriter(rawClientTls)
+					if _, err := io.Copy(chunked, resp.Body); err != nil {
+						ctx.Warnf("Cannot write TLS response body from mitm'd client: %v", err)
+						return
+					}
+					if err := chunked.Close(); err != nil {
+						ctx.Warnf("Cannot write TLS chunked EOF from mitm'd client: %v", err)
+						return
+					}
+					if _, err = io.WriteString(rawClientTls, "\r\n"); err != nil {
+						ctx.Warnf("Cannot write TLS response chunked trailer from mitm'd client: %v", err)
+						return
+					}
+				}
+			}
+			ctx.Logf("Exiting on EOF")
+		}()
 	case ConnectProxyAuthHijack:
 		proxyClient.Write([]byte("HTTP/1.1 407 Proxy Authentication Required\r\n"))
 		todo.Hijack(r, proxyClient, ctx)
